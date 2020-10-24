@@ -78,7 +78,6 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
         return data;
     }
 
-
     public static final class AbortedTransaction {
         public final long producerId;
         public final long firstOffset;
@@ -130,18 +129,52 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
             // When we convert the PartitionData (and other fields) into FetchResponseData down in toMessage, we
             // set the partition IDs.
             this.partitionResponse = partitionResponse;
-            this.preferredReplica = Optional.of(partitionResponse.partitionHeader().preferredReadReplica())
+            this.preferredReplica = Optional.of(partitionResponse.preferredReadReplica())
                 .filter(replicaId -> replicaId != INVALID_PREFERRED_REPLICA_ID);
 
-            if (partitionResponse.partitionHeader().abortedTransactions() == null) {
+            if (partitionResponse.abortedTransactions() == null) {
                 this.abortedTransactions = null;
             } else {
-                this.abortedTransactions = partitionResponse.partitionHeader().abortedTransactions().stream()
+                this.abortedTransactions = partitionResponse.abortedTransactions().stream()
                     .map(AbortedTransaction::fromMessage)
                     .collect(Collectors.toList());
             }
 
-            this.error = Errors.forCode(partitionResponse.partitionHeader().errorCode());
+            this.error = Errors.forCode(partitionResponse.errorCode());
+        }
+
+        public PartitionData(Errors error,
+                             long highWatermark,
+                             long lastStableOffset,
+                             long logStartOffset,
+                             Optional<Integer> preferredReadReplica,
+                             List<AbortedTransaction> abortedTransactions,
+                             Optional<FetchResponseData.EpochEndOffset> divergingEpoch,
+                             T records) {
+            this.preferredReplica = preferredReadReplica;
+            this.abortedTransactions = abortedTransactions;
+            this.error = error;
+
+            FetchResponseData.FetchablePartitionResponse partitionResponse =
+                new FetchResponseData.FetchablePartitionResponse();
+            partitionResponse.setErrorCode(error.code())
+                .setHighWatermark(highWatermark)
+                .setLastStableOffset(lastStableOffset)
+                .setLogStartOffset(logStartOffset);
+            if (abortedTransactions != null) {
+                partitionResponse.setAbortedTransactions(abortedTransactions.stream().map(
+                    aborted -> new FetchResponseData.AbortedTransaction()
+                        .setProducerId(aborted.producerId)
+                        .setFirstOffset(aborted.firstOffset))
+                    .collect(Collectors.toList()));
+            } else {
+                partitionResponse.setAbortedTransactions(null);
+            }
+            partitionResponse.setPreferredReadReplica(preferredReadReplica.orElse(INVALID_PREFERRED_REPLICA_ID));
+            partitionResponse.setRecordSet(records);
+            divergingEpoch.ifPresent(partitionResponse::setDivergingEpoch);
+
+            this.partitionResponse = partitionResponse;
         }
 
         public PartitionData(Errors error,
@@ -151,27 +184,8 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
                              Optional<Integer> preferredReadReplica,
                              List<AbortedTransaction> abortedTransactions,
                              T records) {
-            this.preferredReplica = preferredReadReplica;
-            this.abortedTransactions = abortedTransactions;
-            this.error = error;
-            FetchResponseData.PartitionHeader partitionHeader = new FetchResponseData.PartitionHeader();
-            partitionHeader.setErrorCode(error.code())
-                .setHighWatermark(highWatermark)
-                .setLastStableOffset(lastStableOffset)
-                .setLogStartOffset(logStartOffset);
-            if (abortedTransactions != null) {
-                partitionHeader.setAbortedTransactions(abortedTransactions.stream().map(
-                    aborted -> new FetchResponseData.AbortedTransaction()
-                        .setProducerId(aborted.producerId)
-                        .setFirstOffset(aborted.firstOffset))
-                    .collect(Collectors.toList()));
-            } else {
-                partitionHeader.setAbortedTransactions(null);
-            }
-            partitionHeader.setPreferredReadReplica(preferredReadReplica.orElse(INVALID_PREFERRED_REPLICA_ID));
-            this.partitionResponse = new FetchResponseData.FetchablePartitionResponse()
-                .setPartitionHeader(partitionHeader)
-                .setRecordSet(records);
+            this(error, highWatermark, lastStableOffset, logStartOffset, preferredReadReplica,
+                abortedTransactions, Optional.empty(), records);
         }
 
         public PartitionData(Errors error,
@@ -208,6 +222,7 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
                     ", logStartOffset = " + logStartOffset() +
                     ", preferredReadReplica = " + preferredReadReplica().map(Object::toString).orElse("absent") +
                     ", abortedTransactions = " + abortedTransactions() +
+                    ", divergingEpoch =" + divergingEpoch() +
                     ", recordsSizeInBytes=" + records().sizeInBytes() + ")";
         }
 
@@ -216,15 +231,15 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
         }
 
         public long highWatermark() {
-            return partitionResponse.partitionHeader().highWatermark();
+            return partitionResponse.highWatermark();
         }
 
         public long lastStableOffset() {
-            return partitionResponse.partitionHeader().lastStableOffset();
+            return partitionResponse.lastStableOffset();
         }
 
         public long logStartOffset() {
-            return partitionResponse.partitionHeader().logStartOffset();
+            return partitionResponse.logStartOffset();
         }
 
         public Optional<Integer> preferredReadReplica() {
@@ -233,6 +248,15 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
 
         public List<AbortedTransaction> abortedTransactions() {
             return abortedTransactions;
+        }
+
+        public Optional<FetchResponseData.EpochEndOffset> divergingEpoch() {
+            FetchResponseData.EpochEndOffset epochEndOffset = partitionResponse.divergingEpoch();
+            if (epochEndOffset.epoch() < 0) {
+                return Optional.empty();
+            } else {
+                return Optional.of(epochEndOffset);
+            }
         }
 
         @SuppressWarnings("unchecked")
@@ -342,8 +366,7 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
         LinkedHashMap<TopicPartition, PartitionData<T>> responseMap = new LinkedHashMap<>();
         message.responses().forEach(topicResponse -> {
             topicResponse.partitionResponses().forEach(partitionResponse -> {
-                FetchResponseData.PartitionHeader partitionHeader = partitionResponse.partitionHeader();
-                TopicPartition tp = new TopicPartition(topicResponse.topic(), partitionHeader.partition());
+                TopicPartition tp = new TopicPartition(topicResponse.topic(), partitionResponse.partition());
                 PartitionData<T> partitionData = new PartitionData<>(partitionResponse);
                 responseMap.put(tp, partitionData);
             });
@@ -366,7 +389,7 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
             List<FetchResponseData.FetchablePartitionResponse> partitionResponses = new ArrayList<>();
             partitionDataTopicAndPartitionData.partitions.forEach((partitionId, partitionData) -> {
                 // Since PartitionData alone doesn't know the partition ID, we set it here
-                partitionData.partitionResponse.partitionHeader().setPartition(partitionId);
+                partitionData.partitionResponse.setPartition(partitionId);
                 partitionResponses.add(partitionData.partitionResponse);
             });
             topicResponseList.add(new FetchResponseData.FetchableTopicResponse()
